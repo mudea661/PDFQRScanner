@@ -1,6 +1,8 @@
 import json
 import os
 import queue
+import shutil
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -11,6 +13,58 @@ import numpy as np
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+def _check_wechat_runtime(model_dir: Path) -> tuple[bool, str]:
+    required = [
+        "detect.prototxt",
+        "detect.caffemodel",
+        "sr.prototxt",
+        "sr.caffemodel",
+    ]
+    missing = [name for name in required if not (model_dir / name).exists()]
+    if missing:
+        return False, f"WeChat模型缺失: {', '.join(missing)}"
+    if not hasattr(cv2, "wechat_qrcode_WeChatQRCode"):
+        return False, "当前OpenCV不支持WeChatQRCode（请安装 opencv-contrib-python）"
+    return True, ""
+
+def _prepare_wechat_model_dir(model_dir: Path) -> Path:
+    required = ["detect.prototxt", "detect.caffemodel", "sr.prototxt", "sr.caffemodel"]
+    try:
+        str(model_dir).encode("ascii")
+        return model_dir
+    except UnicodeEncodeError:
+        pass
+
+    compat_dir = Path(tempfile.gettempdir()) / "pdfqr_wechat_models"
+    compat_dir.mkdir(parents=True, exist_ok=True)
+    for name in required:
+        src = model_dir / name
+        dst = compat_dir / name
+        if src.exists():
+            shutil.copy2(src, dst)
+    return compat_dir
+
+_opencv_detector = None
+_wechat_detector = None
+
+def _init_detectors(model_dir_str, use_wechat):
+    global _opencv_detector, _wechat_detector
+    _opencv_detector = cv2.QRCodeDetector()
+    _wechat_detector = None
+    if not use_wechat:
+        return
+    try:
+        model_dir = Path(model_dir_str)
+        actual_model_dir = _prepare_wechat_model_dir(model_dir)
+        _wechat_detector = cv2.wechat_qrcode_WeChatQRCode(
+            str(actual_model_dir / "detect.prototxt"),
+            str(actual_model_dir / "detect.caffemodel"),
+            str(actual_model_dir / "sr.prototxt"),
+            str(actual_model_dir / "sr.caffemodel")
+        )
+    except Exception:
+        _wechat_detector = None
 
 def _render_page_to_bgr(page: fitz.Page, zoom: float) -> np.ndarray:
     mat = fitz.Matrix(zoom, zoom)
@@ -47,21 +101,11 @@ def _decode_qr_wechat(detector, bgr: np.ndarray) -> list[str]:
     return []
 
 def _process_single_page(args):
-    pdf_path_str, page_index, zoom, try_rotations, use_wechat, model_dir = args
+    pdf_path_str, page_index, zoom, try_rotations, model_dir, use_wechat = args
     
-    opencv_detector = cv2.QRCodeDetector()
-    wechat_detector = None
-    
-    if use_wechat:
-        try:
-            wechat_detector = cv2.wechat_qrcode_WeChatQRCode(
-                str(model_dir / "detect.prototxt"),
-                str(model_dir / "detect.caffemodel"),
-                str(model_dir / "sr.prototxt"),
-                str(model_dir / "sr.caffemodel")
-            )
-        except Exception:
-            pass
+    global _opencv_detector, _wechat_detector
+    if _opencv_detector is None:
+        _init_detectors(str(model_dir), use_wechat)
     
     page_texts = set()
     
@@ -80,11 +124,11 @@ def _process_single_page(args):
                 ])
             
             for img in images_to_try:
-                for text in _decode_qr_opencv(opencv_detector, img):
+                for text in _decode_qr_opencv(_opencv_detector, img):
                     page_texts.add(text)
                 
-                if wechat_detector:
-                    for text in _decode_qr_wechat(wechat_detector, img):
+                if _wechat_detector:
+                    for text in _decode_qr_wechat(_wechat_detector, img):
                         page_texts.add(text)
     
     except Exception:
@@ -101,13 +145,14 @@ def extract_pdf_qr(pdf_path, model_dir, zoom, try_rotations, use_wechat, workers
     
     tasks = []
     for i in range(1, total_pages + 1):
-        tasks.append((str(pdf_path), i, zoom, try_rotations, use_wechat, model_dir))
+        tasks.append((str(pdf_path), i, zoom, try_rotations, str(model_dir), use_wechat))
     
     all_results = {}
     seen_texts = set()
     done = 0
     
     if workers <= 1:
+        _init_detectors(str(model_dir), use_wechat)
         for task in tasks:
             page_idx, texts = _process_single_page(task)
             if texts:
@@ -121,7 +166,11 @@ def extract_pdf_qr(pdf_path, model_dir, zoom, try_rotations, use_wechat, workers
             if done % 100 == 0:
                 log_cb(f"[{done}/{total_pages}] 已处理 {done} 页")
     else:
-        with ProcessPoolExecutor(max_workers=workers) as executor:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_detectors,
+            initargs=(str(model_dir), use_wechat),
+        ) as executor:
             future_to_page = {executor.submit(_process_single_page, t): t[1] for t in tasks}
             
             for future in as_completed(future_to_page):
@@ -300,6 +349,16 @@ class App(tk.Tk):
         self.total_var.set("0")
         self.time_var.set("")
         self._set_running(True)
+
+        if self.wechat_var.get():
+            model_dir = Path(__file__).resolve().parent / "opencv_3rdparty"
+            ok, reason = _check_wechat_runtime(model_dir)
+            if not ok:
+                self.wechat_var.set(False)
+                messagebox.showwarning(
+                    "WeChat识别不可用",
+                    f"{reason}\n\n已自动关闭“使用WeChat识别”，将仅使用OpenCV原生识别。"
+                )
         
         t = threading.Thread(
             target=self._run_job,
@@ -334,7 +393,7 @@ class App(tk.Tk):
             
             results = extract_pdf_qr(
                 pdf_path=pdf,
-                model_dir=Path("opencv_3rdparty"),
+                model_dir=(Path(__file__).resolve().parent / "opencv_3rdparty"),
                 zoom=zoom,
                 try_rotations=rotate,
                 use_wechat=use_wechat,
